@@ -3,6 +3,7 @@
 
 import { type Subprocess } from "bun";
 import type { AppId, AppState } from "../shared/types";
+import type { McpToolInfo } from "./tunnel";
 
 interface McpServerConfig {
 	command: string;
@@ -34,13 +35,6 @@ const MCP_SERVERS: Record<AppId, McpServerConfig> = {
 		args: [],
 	},
 };
-
-interface McpToolInfo {
-	id: string;
-	name: string;
-	description: string;
-	serverName: string;
-}
 
 interface ManagedServer {
 	process: Subprocess;
@@ -98,7 +92,8 @@ export class McpManager {
 			});
 			proc.stdin.write(initRequest + "\n");
 
-			// Read the initialize response to get tools
+			// Read the initialize response, then discover tools
+			await this.readMcpResponse(proc, 5000);
 			const tools = await this.discoverTools(proc, appId);
 
 			this.servers.set(appId, { process: proc, tools, appId });
@@ -145,31 +140,47 @@ export class McpManager {
 		return tools;
 	}
 
-	async callTool(
-		serverName: string,
-		toolName: string,
+	/**
+	 * Call a tool by its compound id (e.g. "whatsapp__send_message").
+	 * This matches the protocol used by GhostChatAgent's tool_request.
+	 */
+	async callToolById(
+		toolId: string,
 		args: Record<string, unknown>,
-	): Promise<unknown> {
-		// Find which server owns this tool
+	): Promise<string> {
 		for (const server of this.servers.values()) {
-			const tool = server.tools.find(
-				(t) => t.serverName === serverName && t.name === toolName,
-			);
+			const tool = server.tools.find((t) => t.id === toolId);
 			if (tool) {
-				return this.sendMcpRequest(server.process, "tools/call", {
-					name: toolName,
-					arguments: args,
-				});
+				const result = await this.sendMcpRequest(
+					server.process,
+					"tools/call",
+					{ name: tool.name, arguments: args },
+				);
+				// MCP tools/call returns { content: [{ type, text }] }
+				if (
+					result &&
+					typeof result === "object" &&
+					"content" in (result as any)
+				) {
+					const content = (result as any).content;
+					if (Array.isArray(content)) {
+						return content
+							.map((c: any) => c.text ?? JSON.stringify(c))
+							.join("\n");
+					}
+				}
+				return typeof result === "string"
+					? result
+					: JSON.stringify(result);
 			}
 		}
-		throw new Error(`Tool ${serverName}/${toolName} not found`);
+		throw new Error(`Tool ${toolId} not found in any active MCP server`);
 	}
 
 	private async discoverTools(
 		proc: Subprocess,
 		appId: AppId,
 	): Promise<McpToolInfo[]> {
-		// After initialization, list tools
 		const listRequest = JSON.stringify({
 			jsonrpc: "2.0",
 			id: 2,
@@ -178,7 +189,6 @@ export class McpManager {
 		});
 		proc.stdin.write(listRequest + "\n");
 
-		// Read response with timeout
 		const response = await this.readMcpResponse(proc, 5000);
 		if (response?.result?.tools) {
 			return response.result.tools.map(

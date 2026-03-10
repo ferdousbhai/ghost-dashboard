@@ -1,5 +1,7 @@
 // WebSocket tunnel client — connects to SummonGhost server
-// Ported from ghost-cli's cmd_tunnel.go
+// Handles two message flows:
+// 1. Raw command execution (TunnelAgent: command → result)
+// 2. MCP tool forwarding (GhostChatAgent: project_context, tool_request → tool_response)
 
 import type { TunnelStatus } from "../shared/types";
 
@@ -8,8 +10,14 @@ const INITIAL_BACKOFF = 10_000; // 10s
 const MAX_BACKOFF = 300_000; // 5min
 const MAX_RETRIES = 10;
 
-type StatusCallback = (status: TunnelStatus, error?: string) => void;
-type CommandCallback = (command: TunnelCommand) => Promise<TunnelResult>;
+// --- Shared types matching summon-ghost server protocol ---
+
+export interface McpToolInfo {
+	id: string;
+	name: string;
+	description: string;
+	serverName: string;
+}
 
 interface TunnelCommand {
 	type: "command";
@@ -29,18 +37,44 @@ interface TunnelResult {
 	exitCode: number;
 }
 
+export interface ToolRequest {
+	type: "tool_request";
+	toolCallId: string;
+	name: string;
+	args: Record<string, unknown>;
+}
+
+interface ToolResponse {
+	type: "tool_response";
+	toolCallId: string;
+	result?: string;
+	error?: string;
+}
+
+interface ProjectContext {
+	type: "project_context";
+	cwd: string;
+	mcpTools: McpToolInfo[];
+}
+
+type StatusCallback = (status: TunnelStatus, error?: string) => void;
+type CommandCallback = (command: TunnelCommand) => Promise<TunnelResult>;
+type ToolRequestCallback = (request: ToolRequest) => Promise<ToolResponse>;
+
 export class TunnelClient {
 	private ws: WebSocket | null = null;
 	private pingTimer: ReturnType<typeof setInterval> | null = null;
 	private retryCount = 0;
 	private backoff = INITIAL_BACKOFF;
 	private intentionalClose = false;
+	private currentTools: McpToolInfo[] = [];
 
 	constructor(
 		private serverUrl: string,
 		private token: string,
 		private onStatus: StatusCallback,
 		private onCommand: CommandCallback,
+		private onToolRequest: ToolRequestCallback,
 	) {}
 
 	connect() {
@@ -58,6 +92,11 @@ export class TunnelClient {
 			this.backoff = INITIAL_BACKOFF;
 			this.onStatus("connected");
 			this.startPing();
+
+			// Re-send current tool list on reconnect
+			if (this.currentTools.length > 0) {
+				this.sendProjectContext(this.currentTools);
+			}
 		};
 
 		this.ws.onmessage = async (event) => {
@@ -71,6 +110,9 @@ export class TunnelClient {
 				if (data.type === "command") {
 					const result = await this.onCommand(data as TunnelCommand);
 					this.send(result);
+				} else if (data.type === "tool_request") {
+					const response = await this.onToolRequest(data as ToolRequest);
+					this.send(response);
 				}
 			} catch (err) {
 				console.error("[tunnel] Message handling error:", err);
@@ -97,6 +139,20 @@ export class TunnelClient {
 		this.ws?.close();
 		this.ws = null;
 		this.onStatus("disconnected");
+	}
+
+	/** Send updated MCP tool list to the server */
+	sendProjectContext(tools: McpToolInfo[]) {
+		this.currentTools = tools;
+		const msg: ProjectContext = {
+			type: "project_context",
+			cwd: process.cwd(),
+			mcpTools: tools,
+		};
+		this.send(msg);
+		console.log(
+			`[tunnel] Sent project_context with ${tools.length} tools`,
+		);
 	}
 
 	private send(data: unknown) {

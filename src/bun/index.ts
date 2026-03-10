@@ -37,11 +37,24 @@ function broadcastState() {
 	}
 }
 
+/** Push current MCP tool list to the server via tunnel */
+function syncToolsToServer() {
+	if (tunnel) {
+		const tools = mcpManager.getActiveTools();
+		tunnel.sendProjectContext(tools);
+	}
+}
+
 // --- MCP Manager ---
 
 const mcpManager = new McpManager((appId: AppId, appState: AppState) => {
 	state.apps[appId] = appState;
 	broadcastState();
+
+	// When an app finishes starting or stops, sync tool list to server
+	if (appState.status === "active" || appState.status === "idle") {
+		syncToolsToServer();
+	}
 });
 
 // --- Tunnel Client ---
@@ -67,12 +80,11 @@ function setupTunnel() {
 			state.tunnelError = error;
 			broadcastState();
 		},
-		// Command callback — execute commands from the ghost
+		// Command callback — execute raw shell commands from the ghost
 		async (cmd) => {
 			console.log(
-				`[tunnel] Received command: ${cmd.command} ${cmd.args.join(" ")}`,
+				`[tunnel] Command: ${cmd.command} ${cmd.args.join(" ")}`,
 			);
-
 			try {
 				const proc = Bun.spawn([cmd.command, ...cmd.args], {
 					cwd: cmd.cwd || process.cwd(),
@@ -81,20 +93,12 @@ function setupTunnel() {
 					stderr: "pipe",
 					env: process.env,
 				});
-
 				const [stdout, stderr] = await Promise.all([
 					new Response(proc.stdout).text(),
 					new Response(proc.stderr).text(),
 				]);
 				const exitCode = await proc.exited;
-
-				return {
-					type: "result",
-					id: cmd.id,
-					stdout,
-					stderr,
-					exitCode,
-				};
+				return { type: "result", id: cmd.id, stdout, stderr, exitCode };
 			} catch (err) {
 				return {
 					type: "result",
@@ -106,10 +110,31 @@ function setupTunnel() {
 				};
 			}
 		},
+		// Tool request callback — route MCP tool calls to local servers
+		async (req) => {
+			console.log(`[tunnel] Tool request: ${req.name}`, req.args);
+			try {
+				const result = await mcpManager.callToolById(req.name, req.args);
+				return {
+					type: "tool_response",
+					toolCallId: req.toolCallId,
+					result,
+				};
+			} catch (err) {
+				return {
+					type: "tool_response",
+					toolCallId: req.toolCallId,
+					error:
+						err instanceof Error
+							? err.message
+							: "Tool execution failed",
+				};
+			}
+		},
 	);
 }
 
-// --- RPC ---
+// --- RPC (main process <-> webview) ---
 
 const rpc = BrowserView.defineRPC<DashboardRPC>({
 	maxRequestTime: 30000,
