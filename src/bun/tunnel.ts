@@ -1,11 +1,15 @@
-// WebSocket tunnel client — connects to SummonGhost server
-// Handles two message flows:
-// 1. Raw command execution (TunnelAgent: command → result)
-// 2. MCP tool forwarding (GhostChatAgent: project_context, tool_request → tool_response)
+// WebSocket tunnel client — connects to TunnelAgent on SummonGhost
+//
+// Protocol:
+// - Connects to /api/tunnel/ws with Bearer auth
+// - Sends project_context (MCP tools, git info) on connect
+// - Receives tool_request → routes to local executor or MCP → sends tool_response
+// - Receives command → executes locally → sends result
+// - Heartbeat keepalive every 25s
 
 import type { TunnelStatus } from "../shared/types";
 
-const PING_INTERVAL = 25_000; // 25s keepalive
+const HEARTBEAT_INTERVAL = 25_000; // 25s keepalive
 const INITIAL_BACKOFF = 10_000; // 10s
 const MAX_BACKOFF = 300_000; // 5min
 const MAX_RETRIES = 10;
@@ -55,6 +59,9 @@ interface ProjectContext {
 	type: "project_context";
 	cwd: string;
 	mcpTools: McpToolInfo[];
+	gitBranch?: string;
+	gitStatus?: string;
+	fileTree?: string[];
 }
 
 type StatusCallback = (status: TunnelStatus, error?: string) => void;
@@ -63,7 +70,7 @@ type ToolRequestCallback = (request: ToolRequest) => Promise<ToolResponse>;
 
 export class TunnelClient {
 	private ws: WebSocket | null = null;
-	private pingTimer: ReturnType<typeof setInterval> | null = null;
+	private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	private retryCount = 0;
 	private backoff = INITIAL_BACKOFF;
 	private intentionalClose = false;
@@ -81,22 +88,16 @@ export class TunnelClient {
 		this.intentionalClose = false;
 		this.onStatus("connecting");
 
+		// Connect to TunnelAgent (per-user DO)
 		const wsUrl = this.serverUrl.replace(/^http/, "ws") + "/api/tunnel/ws";
+		console.log(`[tunnel] Connecting to ${wsUrl}`);
+
 		this.ws = new WebSocket(wsUrl, {
 			headers: { Authorization: `Bearer ${this.token}` },
 		} as any);
 
 		this.ws.onopen = () => {
-			console.log("[tunnel] Connected");
-			this.retryCount = 0;
-			this.backoff = INITIAL_BACKOFF;
-			this.onStatus("connected");
-			this.startPing();
-
-			// Re-send current tool list on reconnect
-			if (this.currentTools.length > 0) {
-				this.sendProjectContext(this.currentTools);
-			}
+			console.log("[tunnel] WebSocket open, waiting for connected message");
 		};
 
 		this.ws.onmessage = async (event) => {
@@ -107,20 +108,45 @@ export class TunnelClient {
 						: new TextDecoder().decode(event.data as ArrayBuffer),
 				);
 
-				if (data.type === "command") {
-					const result = await this.onCommand(data as TunnelCommand);
-					this.send(result);
-				} else if (data.type === "tool_request") {
-					const response = await this.onToolRequest(data as ToolRequest);
-					this.send(response);
+				switch (data.type) {
+					case "connected":
+						console.log("[tunnel] Connected to ghost:", data.ghostName);
+						this.retryCount = 0;
+						this.backoff = INITIAL_BACKOFF;
+						this.onStatus("connected");
+						this.startHeartbeat();
+						// Send tool list on connect
+						if (this.currentTools.length > 0) {
+							this.sendProjectContext(this.currentTools);
+						}
+						break;
+
+					case "heartbeat_ack":
+						// Server acknowledged our heartbeat
+						break;
+
+					case "command":
+						const result = await this.onCommand(data as TunnelCommand);
+						this.send(result);
+						break;
+
+					case "tool_request":
+						const response = await this.onToolRequest(data as ToolRequest);
+						this.send(response);
+						break;
+
+					default:
+						// Ignore other messages (cf_agent_use_chat_response, etc.)
+						break;
 				}
 			} catch (err) {
 				console.error("[tunnel] Message handling error:", err);
 			}
 		};
 
-		this.ws.onclose = () => {
-			this.stopPing();
+		this.ws.onclose = (event) => {
+			this.stopHeartbeat();
+			console.log(`[tunnel] WebSocket closed: code=${event.code} reason=${event.reason}`);
 			if (!this.intentionalClose) {
 				this.onStatus("disconnected");
 				this.scheduleReconnect();
@@ -135,19 +161,27 @@ export class TunnelClient {
 
 	disconnect() {
 		this.intentionalClose = true;
-		this.stopPing();
+		this.stopHeartbeat();
 		this.ws?.close();
 		this.ws = null;
 		this.onStatus("disconnected");
 	}
 
-	/** Send updated MCP tool list to the server */
-	sendProjectContext(tools: McpToolInfo[]) {
+	/** Send updated project context and MCP tool list to the server */
+	sendProjectContext(
+		tools: McpToolInfo[],
+		extra?: {
+			gitBranch?: string;
+			gitStatus?: string;
+			fileTree?: string[];
+		},
+	) {
 		this.currentTools = tools;
 		const msg: ProjectContext = {
 			type: "project_context",
 			cwd: process.cwd(),
 			mcpTools: tools,
+			...extra,
 		};
 		this.send(msg);
 		console.log(
@@ -161,16 +195,16 @@ export class TunnelClient {
 		}
 	}
 
-	private startPing() {
-		this.pingTimer = setInterval(() => {
-			this.send({ type: "ping" });
-		}, PING_INTERVAL);
+	private startHeartbeat() {
+		this.heartbeatTimer = setInterval(() => {
+			this.send({ type: "heartbeat" });
+		}, HEARTBEAT_INTERVAL);
 	}
 
-	private stopPing() {
-		if (this.pingTimer) {
-			clearInterval(this.pingTimer);
-			this.pingTimer = null;
+	private stopHeartbeat() {
+		if (this.heartbeatTimer) {
+			clearInterval(this.heartbeatTimer);
+			this.heartbeatTimer = null;
 		}
 	}
 

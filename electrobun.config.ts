@@ -7,7 +7,13 @@ export default {
 		version: "0.1.0",
 	},
 	build: {
-		// Vite builds to dist/, we copy from there
+		// Electrobun bundles the RPC entry point for the webview
+		views: {
+			mainview: {
+				entrypoint: "src/mainview/electrobun-entry.ts",
+			},
+		},
+		// Vite builds the React UI to dist/, we copy from there
 		copy: {
 			"dist/index.html": "views/mainview/index.html",
 			"dist/assets": "views/mainview/assets",
