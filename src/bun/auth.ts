@@ -37,7 +37,7 @@ export async function loginViaBrowser(): Promise<void> {
 				});
 			}
 
-			if (!token || (!token.startsWith("sg_local_") && !token.startsWith("sg_cli_"))) {
+			if (!token || !token.startsWith("sg_local_")) {
 				return new Response(errorPage("Invalid token received"), {
 					status: 400,
 					headers: { "Content-Type": "text/html" },
